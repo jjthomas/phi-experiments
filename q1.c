@@ -9,6 +9,7 @@
 #ifdef __linux__
 #define _BSD_SOURCE 500
 #define _POSIX_C_SOURCE 2
+#define _GNU_SOURCE
 #endif
 
 #include <stdlib.h>
@@ -18,6 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <pthread.h>
+#include <sched.h>
 
 #include <omp.h>
 
@@ -26,6 +29,7 @@
 
 
 int NUM_PARALLEL_THREADS = 64;
+int NUM_COPIES = 64;
 
 // A bucket entry.
 struct q1_entry {
@@ -50,8 +54,6 @@ struct gen_data {
     float prob;
     // The input data.
     struct lineitem *items;
-    // The num_buckets. This is a shared hash table across all threads.
-    // Unused if using local bucket strategy.
     struct q1_entry *buckets;
 };
 
@@ -73,116 +75,112 @@ struct lineitem {
     long _pad;
 };
 
-/** Runs a worker for the query with a global shared hash table.
- *
- * TODO
- *
- * @param d the input data.
- * @param tid the thread ID of this worker.
- */
-void run_query_global_table_helper(struct gen_data *d, int tid) {
-    unsigned start = (d->num_items / NUM_PARALLEL_THREADS) * tid;
-    unsigned end = start + (d->num_items / NUM_PARALLEL_THREADS);
-    if (end > d->num_items || tid == NUM_PARALLEL_THREADS - 1) {
-        end = d->num_items;
-    }
-    for (int i = start; i < end; i++) {
-        struct lineitem *item = &d->items[i];
-        if (item->shipdate == PASS) {
-            int bucket = item->bucket;
-            struct q1_entry *e = &d->buckets[bucket];
-#pragma omp atomic
-            e->sum_qty += item->quantity;
-#pragma omp atomic
-            e->sum_base_price += item->extendedprice;
-#pragma omp atomic
-            e->sum_disc_price += (item->extendedprice + item->discount);
-#pragma omp atomic
-            e->sum_charge +=
-                (item->extendedprice + item->discount) * (1 + item->tax);
-#pragma omp atomic
-            e->sum_discount += item->discount;
-#pragma omp atomic
-            e->count++;
-        }
-    }
-}
+struct thread_data {
+  struct gen_data *gd;
+  struct q1_entry *buckets;
+  int use_atomic;
+  int tid;
+};
 
-/** Runs a worker for the query with thread-local hash tables.
- *
- * @param d the input data.
- * @param buckets the local buckets this worker writes into.
- * @param tid the thread ID of this worker.
+/**
+ * Runs a worker for the query with thread-local hash tables.
  */
-void run_query_local_table_helper(struct gen_data *d, struct q1_entry *buckets, int tid) {
-    unsigned start = (d->num_items / NUM_PARALLEL_THREADS) * tid;
-    unsigned end = start + (d->num_items / NUM_PARALLEL_THREADS);
-    if (end > d->num_items || tid == NUM_PARALLEL_THREADS - 1) {
-        end = d->num_items;
+void *run_helper(void *data) {
+    struct thread_data *td = (struct thread_data *)data;
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(td->tid, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) == -1) {
+      printf("unable to set affinitiy for thread %d\n", td->tid);
+    }
+
+    unsigned start = (td->gd->num_items / NUM_PARALLEL_THREADS) * td->tid;
+    unsigned end = start + (td->gd->num_items / NUM_PARALLEL_THREADS);
+    if (end > td->gd->num_items || td->tid == NUM_PARALLEL_THREADS - 1) {
+        end = td->gd->num_items;
     }
 
     for (int i = start; i < end; i++) {
-        struct lineitem *item = &d->items[i];
+        struct lineitem *item = &td->gd->items[i];
         if (item->shipdate == PASS) {
             int bucket = item->bucket;
-            struct q1_entry *e = &buckets[bucket];
-            e->sum_qty += item->quantity;
-            e->sum_base_price += item->extendedprice;
-            e->sum_base_price += (item->extendedprice * item->discount);
-            e->sum_charge +=
+            struct q1_entry *e = &td->buckets[bucket];
+            if (!td->use_atomic) {
+              e->sum_qty += item->quantity;
+              e->sum_base_price += item->extendedprice;
+              e->sum_base_price += (item->extendedprice * item->discount);
+              e->sum_charge +=
+                  (item->extendedprice + item->discount) * (1 + item->tax);
+              e->sum_discount += item->discount;
+              e->count++;
+            } else {
+#pragma omp atomic
+              e->sum_qty += item->quantity;
+#pragma omp atomic
+              e->sum_base_price += item->extendedprice;
+#pragma omp atomic
+              e->sum_disc_price += (item->extendedprice + item->discount);
+#pragma omp atomic
+              e->sum_charge +=
                 (item->extendedprice + item->discount) * (1 + item->tax);
-            e->sum_discount += item->discount;
-            e->count++;
+#pragma omp atomic
+              e->sum_discount += item->discount;
+#pragma omp atomic
+              e->count++;
+            }
         }
     }
-}
 
-/** Runs a the query with a global shared hash table.
- *
- * @param d the input data.
- */
-void run_query_global_table(struct gen_data *d) {
-#pragma omp parallel for
-    for (int i = 0; i < NUM_PARALLEL_THREADS; i++) {
-        run_query_global_table_helper(d, i);
-    }
+    return NULL;
 }
 
 /** Runs a the query with thread-local hash tables which are merged at the end.
  *
  * @param d the input data.
  */
-void run_query_local_table(struct gen_data *d) {
-    struct q1_entry *buckets = (struct q1_entry *)malloc(
-            sizeof(struct q1_entry) * d->num_buckets * NUM_PARALLEL_THREADS);
-    memset(buckets, 0, sizeof(struct q1_entry) * d->num_buckets * NUM_PARALLEL_THREADS);
-
-#pragma omp parallel for
-    for (int i = 0; i < NUM_PARALLEL_THREADS; i++) {
-        run_query_local_table_helper(d, buckets + (d->num_buckets * i), i);
-    }
-
+void run_query(struct gen_data *d, struct q1_entry *buckets) {
     struct timeval start, end, diff;
 
     gettimeofday(&start, 0);
-
-    // Aggregate the values.
+    pthread_t threads[NUM_PARALLEL_THREADS];
+    struct thread_data data[NUM_PARALLEL_THREADS];
+    int threads_per_copy = NUM_PARALLEL_THREADS / NUM_COPIES;
     for (int i = 0; i < NUM_PARALLEL_THREADS; i++) {
-        for (int j = 0; j < d->num_buckets; j++) {
-            int b = i * d->num_buckets + j;
-            d->buckets[j].sum_qty += buckets[b].sum_qty;
-            d->buckets[j].sum_base_price += buckets[b].sum_base_price;
-            d->buckets[j].sum_disc_price += buckets[b].sum_disc_price;
-            d->buckets[j].sum_charge += buckets[b].sum_charge;
-            d->buckets[j].sum_discount += buckets[b].sum_discount;
-            d->buckets[j].count += buckets[b].count;
-        }
+      data[i] = (struct thread_data) { d, buckets + (d->num_buckets * (i / threads_per_copy)), threads_per_copy > 1, i };
+      pthread_create(threads + i, NULL, &run_helper, (void *)(data + i));
     }
 
+    for (int i = 0; i < NUM_PARALLEL_THREADS; i++) {
+      pthread_join(threads[i], NULL);
+    }
     gettimeofday(&end, 0);
     timersub(&end, &start, &diff);
-    printf("\tagg-time: %ld.%06ld\n",
+    printf("main-time: %ld.%06ld\n",
             (long) diff.tv_sec, (long) diff.tv_usec);
+    
+    gettimeofday(&start, 0);
+    if (NUM_COPIES > 1) {
+      // Aggregate the values.
+      for (int i = 0; i < NUM_COPIES; i++) {
+          for (int j = 0; j < d->num_buckets; j++) {
+              int b = i * d->num_buckets + j;
+              d->buckets[j].sum_qty += buckets[b].sum_qty;
+              d->buckets[j].sum_base_price += buckets[b].sum_base_price;
+              d->buckets[j].sum_disc_price += buckets[b].sum_disc_price;
+              d->buckets[j].sum_charge += buckets[b].sum_charge;
+              d->buckets[j].sum_discount += buckets[b].sum_discount;
+              d->buckets[j].count += buckets[b].count;
+          }
+      }
+    } else {
+      memcpy(d->buckets, buckets, sizeof(struct q1_entry) * d->num_buckets);
+    }
+    gettimeofday(&end, 0);
+    timersub(&end, &start, &diff);
+    printf("agg-time: %ld.%06ld\n",
+            (long) diff.tv_sec, (long) diff.tv_usec);
+
 }
 
 /** Generates input data.
@@ -227,9 +225,11 @@ struct gen_data generate_data(int num_items, int num_buckets, float prob) {
     return d;
 }
 
-double gb_s(int num_items, struct timeval diff) {
-  double secs = diff.tv_sec + diff.tv_usec / ((double)1e6);
-  return num_items * sizeof(struct lineitem) / ((double)1e9) / secs;
+double gb_s(int num_items, int num_its, struct timeval diff) {
+  printf("total-time: %ld.%06ld\n",
+          (long) diff.tv_sec, (long) diff.tv_usec);
+  double secs = diff.tv_sec + diff.tv_usec / ((double)1e6) - 0.01 * num_its; // correction for thread startup
+  return ((uint64_t)num_items) * num_its * sizeof(struct lineitem) / ((double)1e9) / secs;
 }
 
 int main(int argc, char **argv) {
@@ -241,7 +241,7 @@ int main(int argc, char **argv) {
     float prob = 0.01;
 
     int ch;
-    while ((ch = getopt(argc, argv, "b:n:p:t:")) != -1) {
+    while ((ch = getopt(argc, argv, "b:n:p:t:c:")) != -1) {
         switch (ch) {
             case 'b':
                 num_buckets = atoi(optarg);
@@ -254,6 +254,9 @@ int main(int argc, char **argv) {
                 break;
 	    case 't':
                 NUM_PARALLEL_THREADS = atoi(optarg);
+                break;
+	    case 'c':
+                NUM_COPIES = atoi(optarg);
                 break;
             case '?':
             default:
@@ -268,46 +271,37 @@ int main(int argc, char **argv) {
     assert(prob >= 0.0 && prob <= 1.0);
     assert(num_buckets % 2 == 0);
     assert(NUM_PARALLEL_THREADS > 0);
+    assert(NUM_COPIES > 0);
+    assert(NUM_PARALLEL_THREADS % NUM_COPIES == 0);
 
     omp_set_num_threads(NUM_PARALLEL_THREADS);
-    printf("n=%d, b=%d, p=%f, t=%d\n", num_items, num_buckets, prob, NUM_PARALLEL_THREADS);
+    printf("n=%d, b=%d, p=%f, t=%d, c=%d\n\n", num_items, num_buckets, prob, NUM_PARALLEL_THREADS, NUM_COPIES);
 
     struct gen_data d = generate_data(num_items, num_buckets, prob);
     long sum;
-    struct timeval start, end, diff;
+    struct timeval start, end, diff, total;
+    timerclear(&total);
 
-    for (int i = 0; i < 5; i++) {
-      gettimeofday(&start, 0);
-      run_query_local_table(&d);
-      gettimeofday(&end, 0);
-      timersub(&end, &start, &diff);
-      printf("Local: %0.2f GB/s (result=%d %d)\n",
-              gb_s(num_items, diff),
-              d.buckets[0].count, d.buckets[0].sum_charge);
-
-      // For easy parsing
-      printf(">>> L(result=%d %d):%ld.%06ld\t%d\t%d\t%f\n",
-              d.buckets[0].count, d.buckets[0].sum_charge,
-              (long) diff.tv_sec, (long) diff.tv_usec,
-              num_items, num_buckets, prob);
-
+    struct q1_entry *buckets = (struct q1_entry *)malloc(
+            sizeof(struct q1_entry) * d.num_buckets * NUM_COPIES);
+    int ITS = 10;
+    for (int i = 0; i < ITS; i++) {
       // Reset the buckets.
       memset(d.buckets, 0, sizeof(struct q1_entry) * d.num_buckets);
+      memset(buckets, 0, sizeof(struct q1_entry) * d.num_buckets * NUM_COPIES);
 
       gettimeofday(&start, 0);
-      run_query_global_table(&d);
+      run_query(&d, buckets);
       gettimeofday(&end, 0);
-      timersub(&end, &start, &diff);
-      printf("Global: %0.2f GB/s (result=%d %d)\n",
-              gb_s(num_items, diff),
-              d.buckets[0].count, d.buckets[0].sum_charge);
 
-      // For easy parsing
-      printf(">>> G(result=%d %d):%ld.%06ld\t%d\t%d\t%f\n",
-              d.buckets[0].count, d.buckets[0].sum_charge,
-              (long) diff.tv_sec, (long) diff.tv_usec,
-              num_items, num_buckets, prob);
+      timersub(&end, &start, &diff);
+      timeradd(&total, &diff, &total);
+      printf("result: %d %d\n\n",
+              d.buckets[0].count, d.buckets[0].sum_charge);
     }
+
+    printf("%0.2f GB/s\n", gb_s(num_items, ITS, total));
+    free(buckets);
 
     return 0;
 }
