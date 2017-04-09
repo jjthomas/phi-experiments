@@ -97,8 +97,12 @@ void *run_helper(void *data) {
     return NULL;
 }
 
+double get_secs(struct timeval diff) {
+  return diff.tv_sec + diff.tv_usec / ((double)1e6);
+}
+
 double gb_s(int num_items, struct timeval diff) {
-  double secs = diff.tv_sec + diff.tv_usec / ((double)1e6);
+  double secs = get_secs(diff);
   return ((uint64_t)num_items) * ITS * sizeof(uint32_t) / ((double)1e9) / secs;
 }
 
@@ -145,6 +149,7 @@ void run_query(struct gen_data *d) {
     }
 
     printf("%0.2f GB/s\n", gb_s(d->num_items, total));
+    printf("%0.6f\n", get_secs(total) / ITS * 1000);
 
     for (int i = 0; i < NUM_PARALLEL_THREADS; i++) {
       pthread_join(threads[i], NULL);
@@ -212,7 +217,7 @@ int main(int argc, char **argv) {
     assert(NUM_PARALLEL_THREADS % NUM_COPIES == 0);
 
     omp_set_num_threads(NUM_PARALLEL_THREADS);
-    printf("n=%d, b=%d, t=%d, c=%d\n\n", num_items, num_buckets, NUM_PARALLEL_THREADS, NUM_COPIES);
+    printf("n=%d, b=%d, t=%d, c=%d\n", num_items, num_buckets, NUM_PARALLEL_THREADS, NUM_COPIES);
 
     struct gen_data d = generate_data(num_items, num_buckets);
     run_query(&d);
