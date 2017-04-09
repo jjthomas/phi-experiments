@@ -29,6 +29,8 @@ int NUM_PARALLEL_THREADS = 64;
 int NUM_COPIES = 64;
 int ITS = 10;
 
+#define BASE_NODE 0
+
 // The generated input data.
 struct gen_data {
     // Number of lineitems in the table.
@@ -65,7 +67,7 @@ void *run_helper(void *data) {
     int threads_per_copy = NUM_PARALLEL_THREADS / NUM_COPIES; 
     if (td->tid % threads_per_copy == 0) {
       td->copies[td->tid / threads_per_copy] = (uint32_t *)numa_alloc_onnode(sizeof(uint32_t) * td->gd->num_buckets,
-	numa_node_of_cpu(td->tid) + 4);
+	numa_node_of_cpu(td->tid) + BASE_NODE);
     }
     pthread_barrier_wait(&bar);
 
@@ -168,8 +170,8 @@ struct gen_data generate_data(int num_items, int num_buckets) {
 
     d.num_items = num_items;
     d.num_buckets = num_buckets;
-    d.items = (uint32_t *)numa_alloc_onnode(sizeof(uint32_t) * num_items, 4);
-    d.buckets = (uint32_t *)numa_alloc_onnode(sizeof(uint32_t) * num_buckets, 4);
+    d.items = (uint32_t *)numa_alloc_onnode(sizeof(uint32_t) * num_items, BASE_NODE);
+    d.buckets = (uint32_t *)numa_alloc_onnode(sizeof(uint32_t) * num_buckets, BASE_NODE);
 
     for (int i = 0; i < d.num_items; i++) {
       d.items[i] = random() % num_buckets;
